@@ -20,18 +20,18 @@ const (
 )
 
 type GameState struct {
-    Board [][]Cell      `json:"board"`
-    Width int           `json:"width"`
-    Height int          `json:"height"`
-    WinLength int       `json:"win_length"`
-    State State         `json:"state"`
+    Board [][]Cell
+    Width int
+    Height int
+    WinLength int
+    State State
 
-    WhoTurn Cell        `json:"who_turn"`
-    IsGameEnded bool    `json:"is_game_ended"`
-    WhoWin Cell         `json:"who_win"`
+    WhoTurn Cell
+    IsGameEnded bool
+    WhoWin Cell
 }
 
-func (gs *GameState) CheckEnd() bool {
+func (gs *GameState) CheckEnd() {
     hasEmpty := false
     for i := 0; i < gs.Height; i++ {
         for j := 0; j < gs.Width; j++ {
@@ -47,7 +47,7 @@ func (gs *GameState) CheckEnd() bool {
                     log.Println("Kek", row, col, diag1, diag2)
                     gs.IsGameEnded = true
                     gs.WhoWin = whoThis
-                    return true
+                    return
                 }
             } else {
                 hasEmpty = true
@@ -58,7 +58,7 @@ func (gs *GameState) CheckEnd() bool {
         gs.IsGameEnded = true
         gs.WhoWin = Empty
     }
-    return true
+    return
 }
 
 func (gs *GameState) MakeMove(i int, j int) bool {
@@ -114,7 +114,7 @@ func ReadMoveFromConsole() (int, int, bool) {
     var i, j int
     _, err := fmt.Scanf("%d %d", &i, &j)
     if err != nil {
-        return 0, 0, false
+        return -1, -1, false
     }
     return i, j, true
 }
@@ -124,10 +124,10 @@ func RunConsoleGameLoop(gs GameState) {
         log.Fatal("Invalid params")
         return
     }
-    for true {
+    for i := 1; i != 0; {
         gs.ResetGame()
         log.Println(gs)
-        for true {
+        for gs.IsGameEnded {
             x, y, okRead := ReadMoveFromConsole()
             okSet := gs.MakeMove(x, y)
             if !okRead || !okSet {
@@ -135,24 +135,19 @@ func RunConsoleGameLoop(gs GameState) {
                 continue
             }
             gs.ShowBoardOnConsole()
-            if gs.IsGameEnded {
-                switch gs.WhoWin {
-                case Empty:
-                    fmt.Printf("Ничья\n")
-                case X:
-                    fmt.Printf("Победили крестики\n")
-                case O:
-                    fmt.Printf("Победили нолики\n")
-                }
-                break
-            }
         }
+
+        switch gs.WhoWin {
+        case Empty:
+            fmt.Printf("Ничья\n")
+        case X:
+            fmt.Printf("Победили крестики\n")
+        case O:
+            fmt.Printf("Победили нолики\n")
+        }
+
         fmt.Printf("Введите 1 чтобы сыграть еще раз или 0 для выхода ")
-        var i int
         fmt.Scanf("%d", &i)
-        if i == 0 {
-            break
-        }
     }
 }
 

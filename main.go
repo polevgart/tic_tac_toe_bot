@@ -23,34 +23,82 @@ const (
     EndGame         = "EndGame"
 )
 
+type UserCustomization struct {
+    X, O, Empty, XLast, OLast string
+}
+
 type UserState struct {
-    GameState game.GameState    `json:"game_state"`
-    OpponentUser *telebot.User  `json:"opponent_user"`
-    WhoMe game.Cell             `json:"who_me"`
-    State State                 `json:"state"`
+    GameState game.GameState
+    OpponentUser *telebot.User
+    WhoMe game.Cell
+    State State
+
+    Customization UserCustomization
+    Selector *telebot.ReplyMarkup
+    LastX, LastY int
+
+    mutex sync.Mutex
 }
 
 func (us *UserState) CanMeMakeMove() bool {
+    us.mutex.Lock()
+    defer us.mutex.Unlock()
     log.Println("123", us.WhoMe, us.GameState.WhoTurn)
     return us.WhoMe == us.GameState.WhoTurn
 }
 
 func (us *UserState) MakeMove(i int, j int) bool {
+    us.mutex.Lock()
+    defer us.mutex.Unlock()
     ok := us.GameState.MakeMove(i, j)
     return ok
+}
+
+func (us *UserState) ResetGame() {
+    us.mutex.Lock()
+    defer us.mutex.Unlock()
+    us.GameState.ResetGame()
+    for _, row := range us.Selector.InlineKeyboard {
+        for _, btn := range row {
+            btn.Text = us.Customization.Empty
+        }
+    }
+}
+
+func constructSelectorBoard(buttonsWidth, buttonsHeight int) *telebot.ReplyMarkup {
+    selector := &telebot.ReplyMarkup{}
+    buttons := make([]telebot.Row, buttonsHeight)
+    for i := 0; i < buttonsHeight; i++ {
+        buttons[i] = make([]telebot.Btn, buttonsWidth)
+        for j := 0; j < buttonsWidth; j++ {
+            buttons[i][j] = selector.Data("🌫", strconv.Itoa(i * buttonsWidth + j))
+        }
+    }
+    selector.Inline(buttons...)
+    return selector
 }
 
 func NewUser() UserState {
     us := UserState{
         GameState: game.GameState{
-            Width: 8,
-            Height: 8,
+            Width:     8,
+            Height:    8,
             WinLength: 5,
         },
         WhoMe: game.X,
         State: Start,
+        Customization: UserCustomization{
+            X:     "❌",
+            O:     "🔴",
+            Empty: "🌫",
+            XLast: "❎",
+            OLast: "🟢",
+        },
+        LastX: -1,
+        LastY: -1,
     }
-    us.GameState.ResetGame()
+    us.Selector = constructSelectorBoard(us.GameState.Width, us.GameState.Height)
+    us.ResetGame()
     return us
 }
 
@@ -169,7 +217,7 @@ func makeEndGame(userMsg string, opponentMsg string, botStorage *TicTacToeBotSto
     }
 }
 
-func constructButtonHandler(i int, j int, botStorage *TicTacToeBotStorage, selector *telebot.ReplyMarkup) func(context telebot.Context) error {
+func constructButtonHandler(i int, j int, botStorage *TicTacToeBotStorage) func(context telebot.Context) error {
     return func(context telebot.Context) error {
         userId := getUserId(context)
         userState := botStorage.getUserState(userId)
@@ -191,7 +239,25 @@ func constructButtonHandler(i int, j int, botStorage *TicTacToeBotStorage, selec
             log.Fatal(err)
         }
 
-        if _, err := botStorage.bot.Send(userState.OpponentUser, userState.GameState.ShowBoardToString(), selector); err != nil {
+
+        opponentState.LastX = i
+        opponentState.LastY = j
+        if userState.WhoMe == game.X {
+            opponentState.Selector.InlineKeyboard[i][j].Text = opponentState.Customization.XLast
+            userState.Selector.InlineKeyboard[i][j].Text = userState.Customization.X
+            if userState.LastX != -1 {
+                userState.Selector.InlineKeyboard[userState.LastX][userState.LastY].Text = userState.Customization.O
+            }
+        } else {
+            opponentState.Selector.InlineKeyboard[i][j].Text = opponentState.Customization.OLast
+            userState.Selector.InlineKeyboard[i][j].Text = userState.Customization.O
+            if userState.LastX != -1 {
+                userState.Selector.InlineKeyboard[userState.LastX][userState.LastY].Text = userState.Customization.X
+            }
+        }
+        botStorage.setUserState(userState.OpponentUser.ID, opponentState)
+
+        if _, err := botStorage.bot.Send(userState.OpponentUser, "Ваш ход", opponentState.Selector); err != nil {
             log.Fatal(err)
             return err
         }
@@ -217,7 +283,7 @@ func constructButtonHandler(i int, j int, botStorage *TicTacToeBotStorage, selec
     }
 }
 
-func startSeachingOpponent(botStorage *TicTacToeBotStorage, context telebot.Context, selector *telebot.ReplyMarkup) error {
+func startSeachingOpponent(botStorage *TicTacToeBotStorage, context telebot.Context) error {
     userId := getUserId(context)
     userState := botStorage.getUserState(userId)
     userState.State = SearchingGame
@@ -235,13 +301,13 @@ func startSeachingOpponent(botStorage *TicTacToeBotStorage, context telebot.Cont
 
         userState.State = InGame
         userState.OpponentUser = &telebot.User{ID: opponentUserId}
-        userState.GameState.ResetGame()
+        userState.ResetGame()
         userState.WhoMe = fig[0]
         botStorage.setUserState(userId, userState)
 
         context.Send(msgOpponentFound)
         if userState.WhoMe == game.X {
-            context.Send(userState.GameState.ShowBoardToString(), selector)
+            context.Send("Ваш ход", userState.Selector)
         } else {
             context.Send("Ожидаем ход соперника")
         }
@@ -249,13 +315,13 @@ func startSeachingOpponent(botStorage *TicTacToeBotStorage, context telebot.Cont
         opponentUserState := botStorage.getUserState(opponentUserId)
         opponentUserState.State = InGame
         opponentUserState.OpponentUser = &telebot.User{ID: userId}
-        opponentUserState.GameState.ResetGame()
+        opponentUserState.ResetGame()
         opponentUserState.WhoMe = fig[1]
         botStorage.setUserState(opponentUserId, opponentUserState)
 
         botStorage.bot.Send(userState.OpponentUser, msgOpponentFound)
         if opponentUserState.WhoMe == game.X {
-            botStorage.bot.Send(userState.OpponentUser, userState.GameState.ShowBoardToString(), selector)
+            botStorage.bot.Send(userState.OpponentUser, "Ваш ход", opponentUserState.Selector)
         } else {
             botStorage.bot.Send(userState.OpponentUser, "Ожидаем ход соперника")
         }
@@ -288,18 +354,15 @@ func main() {
     botStorage.bot = bot
     botStorage.selectorConfirm = selectorConfirm
 
-    selector := &telebot.ReplyMarkup{}
+
     buttonsHeight := 8
     buttonsWidth := 8
-    buttons := make([]telebot.Row, buttonsHeight)
+    buttons := constructSelectorBoard(buttonsWidth, buttonsHeight).InlineKeyboard
     for i := 0; i < buttonsHeight; i++ {
-        buttons[i] = make([]telebot.Btn, buttonsWidth)
         for j := 0; j < buttonsWidth; j++ {
-            buttons[i][j] = selector.Data("🌫", strconv.Itoa(i * buttonsWidth + j))
-            bot.Handle(&buttons[i][j], constructButtonHandler(i, j, &botStorage, selector))
+            bot.Handle(&buttons[i][j], constructButtonHandler(i, j, &botStorage))
         }
     }
-    selector.Inline(buttons...)
 
     bot.Handle(&yesButton, func(context telebot.Context) error {
         defer Save("save.json", botStorage)
@@ -307,9 +370,9 @@ func main() {
         userState := botStorage.getUserState(userId)
         switch userState.State {
         case Start:
-            startSeachingOpponent(&botStorage, context, selector)
+            startSeachingOpponent(&botStorage, context)
         case EndGame:
-            startSeachingOpponent(&botStorage, context, selector)
+            startSeachingOpponent(&botStorage, context)
         }
         return nil
     })
