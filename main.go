@@ -8,6 +8,7 @@ import (
     "math/rand"
     "os"
     "strconv"
+    "strings"
     "sync"
     "time"
 
@@ -29,7 +30,8 @@ type UserCustomization struct {
 
 type UserState struct {
     GameState game.GameState
-    OpponentUser *telebot.User
+    OpponentUserID int64
+    User *telebot.User
     WhoMe game.Cell
     State State
 
@@ -37,13 +39,16 @@ type UserState struct {
     Selector *telebot.ReplyMarkup
     LastX, LastY int
 
+    BadMoveMessages []*telebot.StoredMessage
+    LastBotMsg *telebot.StoredMessage
+    LastBotText string
+
     mutex sync.Mutex
 }
 
 func (us *UserState) CanMeMakeMove() bool {
     us.mutex.Lock()
     defer us.mutex.Unlock()
-    log.Println("123", us.WhoMe, us.GameState.WhoTurn)
     return us.WhoMe == us.GameState.WhoTurn
 }
 
@@ -57,10 +62,12 @@ func (us *UserState) MakeMove(i int, j int) bool {
 func (us *UserState) ResetGame() {
     us.mutex.Lock()
     defer us.mutex.Unlock()
+    us.LastX = -1
+    us.LastY = -1
     us.GameState.ResetGame()
-    for _, row := range us.Selector.InlineKeyboard {
-        for _, btn := range row {
-            btn.Text = us.Customization.Empty
+    for i := range us.Selector.InlineKeyboard {
+        for j := range us.Selector.InlineKeyboard[i] {
+            us.Selector.InlineKeyboard[i][j].Text = us.Customization.Empty
         }
     }
 }
@@ -139,6 +146,21 @@ func (botStorage *TicTacToeBotStorage) setUserState(userId int64, userState User
     botStorage.UserId2UserState[userId] = userState
 }
 
+func (botStorage *TicTacToeBotStorage) RegisterUser(context telebot.Context) UserState {
+    user := context.Sender()
+    userState := botStorage.getUserState(user.ID)
+    if userState.User != nil {
+        return userState
+    }
+
+    log.Println("Registering new user", user.ID)
+    userState.User = user
+    botStorage.setUserState(user.ID, userState)
+
+    Save("save.json", botStorage)
+    return userState
+}
+
 func (botStorage *TicTacToeBotStorage) searchOpponents(userId int64) (int64, bool) {
     botStorage.mutex.Lock()
     defer botStorage.mutex.Unlock()
@@ -165,7 +187,13 @@ func Marshal(v interface{}) (io.Reader, error) {
     return bytes.NewReader(b), nil
 }
 
+var (
+    saveMutex = sync.Mutex{}
+)
+
 func Save(path string, v interface{}) error {
+    saveMutex.Lock()
+    defer saveMutex.Unlock()
     f, err := os.Create(path)
     if err != nil {
         log.Println(err)
@@ -198,21 +226,75 @@ func Load(path string, v interface{}) error {
     return Unmarshal(f, v)
 }
 
+type IsNewMessage bool
+const (
+    NewMessage  IsNewMessage = true
+    EditPreviousMessage      = false
+)
+
+type IsMessageEditable bool
+const (
+    MessageEditable IsMessageEditable = true
+    MessageNotEditable                = false
+)
+
+func SendEditable(botStorage *TicTacToeBotStorage, userState *UserState, newMsg IsNewMessage, editableMsg IsMessageEditable,
+                  what string,  opts ...interface{}) error {
+    defer Save("save.json", botStorage)
+
+    user := userState.User
+    if newMsg && userState.LastBotMsg != nil {
+        log.Println("New message")
+        botStorage.bot.Edit(userState.LastBotMsg, userState.LastBotText)
+    } else if userState.LastBotMsg != nil {
+        log.Println("Edit last message", userState.LastBotText, "to", what)
+        userState.LastBotText = what
+        _, err := botStorage.bot.Edit(userState.LastBotMsg, what, opts...)
+        if !editableMsg {
+            userState.LastBotMsg = nil
+            userState.LastBotText = ""
+        }
+        botStorage.setUserState(user.ID, *userState)
+        return err
+    }
+
+    log.Println("Send new message", what)
+    m, err := botStorage.bot.Send(telebot.Recipient(user), what, opts...)
+    if err != nil {
+        return err
+    }
+    log.Println("Sending complete")
+    if editableMsg {
+        messageID, chatID := m.MessageSig()
+        userState.LastBotMsg = &telebot.StoredMessage{MessageID: messageID, ChatID: chatID}
+        userState.LastBotText = what
+    } else {
+        userState.LastBotMsg = nil
+        userState.LastBotText = ""
+    }
+    botStorage.setUserState(user.ID, *userState)
+    return nil
+}
+
 func makeEndGame(userMsg string, opponentMsg string, botStorage *TicTacToeBotStorage, context telebot.Context) {
     userId := getUserId(context)
     userState := botStorage.getUserState(userId)
-    opponentState := botStorage.getUserState(userState.OpponentUser.ID)
+    opponentState := botStorage.getUserState(userState.OpponentUserID)
     userState.State = EndGame
     botStorage.setUserState(userId, userState)
 
     opponentState.State = EndGame
-    botStorage.setUserState(userState.OpponentUser.ID, opponentState)
+    botStorage.setUserState(userState.OpponentUserID, opponentState)
+
+    SendEditable(botStorage, &userState, EditPreviousMessage, MessageNotEditable, userState.GameState.ShowBoardToString())
+    SendEditable(botStorage, &opponentState, EditPreviousMessage, MessageNotEditable, opponentState.GameState.ShowBoardToString())
 
     questionToNewGame := " Хотите начать новую игру?"
-    if err := context.Send(userMsg + questionToNewGame, botStorage.selectorConfirm); err != nil {
+    if err := SendEditable(botStorage, &userState, NewMessage, MessageEditable, userMsg + questionToNewGame, botStorage.selectorConfirm); err != nil {
         log.Fatal(err)
     }
-    if _, err := botStorage.bot.Send(userState.OpponentUser, opponentMsg + questionToNewGame, botStorage.selectorConfirm); err != nil {
+    if err := SendEditable(botStorage, &opponentState, NewMessage, MessageEditable,
+                              opponentMsg + questionToNewGame, botStorage.selectorConfirm); err != nil {
         log.Fatal(err)
     }
 }
@@ -223,22 +305,36 @@ func constructButtonHandler(i int, j int, botStorage *TicTacToeBotStorage) func(
         userState := botStorage.getUserState(userId)
         log.Println("Handle btn", i, j, userState)
         if !userState.CanMeMakeMove() {
-            return context.Send("Сейчас не твой ход")
+            m, err := botStorage.bot.Send(telebot.Recipient(userState.User), "Сейчас не твой ход")
+            if err == nil {
+                messageID, chatID := m.MessageSig()
+                userState.BadMoveMessages = append(userState.BadMoveMessages, &telebot.StoredMessage{MessageID: messageID, ChatID: chatID})
+                botStorage.setUserState(userId, userState)
+            }
+            return err
         }
         ok := userState.MakeMove(i, j)
         if !ok {
-            return context.Send("Некорректный ход")
+            m, err := botStorage.bot.Send(telebot.Recipient(userState.User), "Некорректный ход")
+            if err == nil {
+                messageID, chatID := m.MessageSig()
+                userState.BadMoveMessages = append(userState.BadMoveMessages, &telebot.StoredMessage{MessageID: messageID, ChatID: chatID})
+                botStorage.setUserState(userId, userState)
+            }
+            return err
         }
         defer Save("save.json", botStorage)
+        for _, msg := range userState.BadMoveMessages {
+            botStorage.bot.Delete(msg)
+        }
         botStorage.setUserState(userId, userState)
 
-        opponentState := botStorage.getUserState(userState.OpponentUser.ID)
+        opponentState := botStorage.getUserState(userState.OpponentUserID)
         opponentState.MakeMove(i, j)
-        botStorage.setUserState(userState.OpponentUser.ID, opponentState)
-        if err := context.Send("Ожидаем ход соперника"); err != nil {
+        botStorage.setUserState(userState.OpponentUserID, opponentState)
+        if err := SendEditable(botStorage, &userState, EditPreviousMessage, MessageEditable, "Ожидаем ход соперника"); err != nil {
             log.Fatal(err)
         }
-
 
         opponentState.LastX = i
         opponentState.LastY = j
@@ -255,9 +351,9 @@ func constructButtonHandler(i int, j int, botStorage *TicTacToeBotStorage) func(
                 userState.Selector.InlineKeyboard[userState.LastX][userState.LastY].Text = userState.Customization.X
             }
         }
-        botStorage.setUserState(userState.OpponentUser.ID, opponentState)
+        botStorage.setUserState(userState.OpponentUserID, opponentState)
 
-        if _, err := botStorage.bot.Send(userState.OpponentUser, "Ваш ход", opponentState.Selector); err != nil {
+        if err := SendEditable(botStorage, &opponentState, EditPreviousMessage, MessageEditable, "Ваш ход", opponentState.Selector); err != nil {
             log.Fatal(err)
             return err
         }
@@ -287,7 +383,7 @@ func startSeachingOpponent(botStorage *TicTacToeBotStorage, context telebot.Cont
     userId := getUserId(context)
     userState := botStorage.getUserState(userId)
     userState.State = SearchingGame
-    if err := context.Send("Ищу соперника..."); err != nil {
+    if err := SendEditable(botStorage, &userState, EditPreviousMessage, MessageEditable, "Ищу соперника..."); err != nil {
         return err
     }
     opponentUserId, found := botStorage.searchOpponents(userId)
@@ -300,30 +396,28 @@ func startSeachingOpponent(botStorage *TicTacToeBotStorage, context telebot.Cont
         rand.Shuffle(len(fig), func(i, j int) { fig[i], fig[j] = fig[j], fig[i] })
 
         userState.State = InGame
-        userState.OpponentUser = &telebot.User{ID: opponentUserId}
-        userState.ResetGame()
+        userState.OpponentUserID = opponentUserId
         userState.WhoMe = fig[0]
         botStorage.setUserState(userId, userState)
 
-        context.Send(msgOpponentFound)
+        SendEditable(botStorage, &userState, EditPreviousMessage, MessageNotEditable, msgOpponentFound)
         if userState.WhoMe == game.X {
-            context.Send("Ваш ход", userState.Selector)
+            SendEditable(botStorage, &userState, EditPreviousMessage, MessageEditable, "Ваш ход", userState.Selector)
         } else {
-            context.Send("Ожидаем ход соперника")
+            SendEditable(botStorage, &userState, EditPreviousMessage, MessageEditable, "Ожидаем ход соперника")
         }
 
         opponentUserState := botStorage.getUserState(opponentUserId)
         opponentUserState.State = InGame
-        opponentUserState.OpponentUser = &telebot.User{ID: userId}
-        opponentUserState.ResetGame()
+        opponentUserState.OpponentUserID = userId
         opponentUserState.WhoMe = fig[1]
         botStorage.setUserState(opponentUserId, opponentUserState)
 
-        botStorage.bot.Send(userState.OpponentUser, msgOpponentFound)
+        SendEditable(botStorage, &opponentUserState, EditPreviousMessage, MessageNotEditable, msgOpponentFound)
         if opponentUserState.WhoMe == game.X {
-            botStorage.bot.Send(userState.OpponentUser, "Ваш ход", opponentUserState.Selector)
+            SendEditable(botStorage, &opponentUserState, EditPreviousMessage, MessageEditable, "Ваш ход", opponentUserState.Selector)
         } else {
-            botStorage.bot.Send(userState.OpponentUser, "Ожидаем ход соперника")
+            SendEditable(botStorage, &opponentUserState, EditPreviousMessage, MessageEditable, "Ожидаем ход соперника")
         }
     }
     return nil
@@ -368,10 +462,10 @@ func main() {
         defer Save("save.json", botStorage)
         userId := getUserId(context)
         userState := botStorage.getUserState(userId)
+        userState.ResetGame()
+        botStorage.setUserState(userId, userState)
         switch userState.State {
-        case Start:
-            startSeachingOpponent(&botStorage, context)
-        case EndGame:
+        case Start, EndGame:
             startSeachingOpponent(&botStorage, context)
         }
         return nil
@@ -379,33 +473,40 @@ func main() {
     bot.Handle(&noButton, func(context telebot.Context) error {
         userState := botStorage.getUserState(getUserId(context))
         switch userState.State {
-        case Start:
-            return context.Send("Окей, тогда до связи!")
+        case Start, EndGame:
+            return SendEditable(&botStorage, &userState, NewMessage, MessageNotEditable, "Окей, тогда до связи!")
         }
         return nil
     })
 
-
     printHelloMsg := func(context telebot.Context) error {
-        defer Save("save.json", botStorage)
-        userState := botStorage.getUserState(getUserId(context))
+        userState := botStorage.RegisterUser(context)
         log.Println("Hello!", userState)
-        return context.Send("Привет! Хочешь сыграть в крестики нолики?", selectorConfirm)
+        return SendEditable(&botStorage, &userState, NewMessage, MessageEditable,
+                            "Привет! Хочешь сыграть в крестики нолики?", selectorConfirm)
     }
 
     log.Println("Started")
     bot.Handle("/hello", printHelloMsg)
     bot.Handle("/start", printHelloMsg)
     bot.Handle("/resign", func(context telebot.Context) error {
-        userState := botStorage.getUserState(getUserId(context))
+        userState := botStorage.RegisterUser(context)
         if userState.State != InGame {
-            context.Send("Вы не в игре, для того чтобы сдаться.")
+            SendEditable(&botStorage, &userState, NewMessage, MessageNotEditable, "Вы не в игре, для того чтобы сдаться.")
             return nil
         }
 
         defer Save("save.json", botStorage)
         makeEndGame("Вы сдались.", "Соперник сдался.", &botStorage, context)
         return nil
+    })
+    bot.Handle("/help", func(context telebot.Context) error {
+        userState := botStorage.RegisterUser(context)
+        return SendEditable(&botStorage, &userState, NewMessage, MessageNotEditable, strings.Join([]string{
+            "/help - помощь",
+            "/resign - сдаться в текущей игре",
+            "/start - начать общение с ботом",
+        }, "\n"))
     })
 
 	bot.Start()
